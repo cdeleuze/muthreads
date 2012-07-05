@@ -1,0 +1,262 @@
+		       µthreads implementation
+		       -----------------------
+
+Principles
+----------
+
+Each thread is made of:
+
+     - a pending_io ref indicating 
+          - the fd on which the thread is currently blocked on a read
+	  operation or,
+          - the fd on which the thread is currently blocked on a write
+	  operation or,
+	  - that no fd is blocked uppon.
+
+       This is useful when the I/O operation is cancelled because of a
+       timer or an exception (see below).
+
+     - a context (list of nested trywith and timeout instructions),
+
+     - a function returning a unit, representing the computation to be
+       performed.
+
+
+A boolean ref 'term' is set to true by the scheduler before starting a
+function.  The function may set it to false before returning.  This
+boolean stands for "schedule me again".  If it is true, the scheduler
+pops the context stack and enqueues it, so that the continuation of
+the thread is scheduled.
+
+If the thread has taken care itself of its continuation (while
+blocking for I/O), or wants to die (case of shot timers, see below) it
+sets term to false.
+
+At each cooperation point, the thread function enqueues its
+continuation (and sets term to false) if there's one and returns ().
+Otherwise term is true, indicating that the thread completed
+execution.  This does not imply the thread is terminated since a (or
+several nested) continuation may be present in the context stack.
+
+So a thread sets term to false it it suspends (in a blocking
+operation) or it wants to die and abandon its context (case of shot
+timers, see below).
+
+ZZZ change term name ???
+
+ZZZ alternative: should threads return their continuation? or the boolean?
+
+All threads ready to run are stored in the runq FIFO queue.
+
+Scheduling
+----------
+
+The scheduler runs an infinite loop.  It first adds check_io in the
+runq and start its loop.  Repeatdly, it sets term to true, dequeues a
+thread from the runq, check it has not been shot (see about timeouts
+below) then run it according to its context.  When the function
+returns, it examines term value and enqueue a continuation if true.
+Now loops.
+
+ZZZ
+
+
+MVars
+-----
+
+There's not much to be said, see lwc!
+
+Performing I/O
+--------------
+
+Unix I/O primitives are replaced with trampolined ones.  Sockets
+are set in non-blocking mode.
+
+* global data structures
+
+rfd the list of fds on which a read operation (read, accept...) has
+been started
+
+wfd same for write operations (write, connect ... ZZZ)
+
+readers - an array indexed by fds (Obj.magic'd to ints).  It contains
+values of the reader type
+
+ type reader =
+  | NoRead
+  | Read     of string * int * int * int thread
+  | Recv     of string * int * int * Unix.msg_flag list * int thread
+  | Recvfrom of string * int * int * Unix.msg_flag list *
+	(int * Unix.sockaddr) thread
+  | Accept   of (Unix.file_descr * Unix.sockaddr) thread
+
+For each fd appearing if rfd, the value in the array indicates the
+type of operation and its parameters (including the thread
+continuation).  All other entries have the NoRead value.
+
+writers - same with the writer type for fds appearing in wfd
+
+type writer = 
+  | NoWrite
+  | Write   of string * int * int * int thread
+  | Connect of unit thread
+
+ZZZ motivation for theses structures
+
+* local data
+
+The pending_io ref shows if and what file descriptor the thread is
+currently blocked on.  This will be used when the operation is
+cancelled by a timeout. ZZZ no exception?
+
+* operations
+
+Here's, for example, how the read primitive works.  It takes the
+continuation k as an additional parameter, and:
+
+ - attempts to perform the read on the given fd,
+
+ - if succeeded, apply the result to k,
+
+ - if not (an exception EWOULDBLOCK or EAGAIN or EINTR is raised),
+save the parameters in the readers array, add fd to the global rfd
+list, note in pending_io that the thread is blocked reading of fd.
+
+An internal try_io thread is run periodically.  It does a select on
+all the blocked upon fds and put back to runq the unblocked threads.
+It also removes the information concerning the pending operation from
+the global data structures and updates the thread pending_io to Nofd.
+
+* limitations
+
+The maximum number of possible fds is set to 65536.  However, for this
+to apply, the ocaml compiler must have been compiled with proper
+modifications of a few systems include files. ZZZZ.  By default, the
+maximum number of open file descriptors is 1024 on most systems.
+
+[TODO: this may be true only on 32 bits arch, check on 64 bits arch]
+
+
+Sleeping
+--------
+
+A thread can go to sleep for a specified amount of time.  It calls the
+sleep function with a delay and continuation.  The thread is inserted
+in a sleepers list.
+
+Each time try_io is run, it checks sleepers and puts back in runq the
+threads for which it's time to.  If no thread is currently ready to
+run, the timeout used for the select is computed for the first thread
+in sleepers.
+
+
+
+Managing timeouts
+-----------------
+
+When thread A in context c calls
+
+     timeout
+         t
+	 operation
+	 when_expired
+	 when_normal
+
+a new thread T is created with context c, and put to sleep for t
+seconds.  Thread A executes operation in the context Timeout(s,
+when_normal)::c where s is a new bool ref.
+
+If operation terminates, A shoots on s, thus killing T, then
+when_normal is enqueued with context c.  T will realize it's been
+killed when the timer finally expires.  It must set term to false to
+really die (otherwise its continuation context will be run!). 
+
+[There was a nasty bug in this implementation]
+
+If T is waken up before being killed, it will:
+
+  - shoot on s, thus killing A,
+
+  - clean up I/O data structures if A was blocked on an I/O operation
+    (for this, a ref to the pending_io of A has been given to T)
+
+  - call when_expired.
+
+All this in context c, since when_expired must run in T's context.
+
+
+* Nested timeouts
+
+Timeouts can be nested.  However, if timeout is called with a delay
+resulting in a expiration date after the expiration date of an already
+existing timeout, we know it will never expire.  The function
+is_valid_timeout checks just this.  If this is the case we just don't
+create a new timeout.  Instead we push NoTimeout(when_normal) on the
+context and execute operation.  The NoTimeout context is just a
+placeholder for the provided continuation.
+
+
+Catching exceptions
+-------------------
+
+When the trywith function is called:
+
+trywith
+	operation
+	handler
+	continuation
+	
+a TryWith(handler, continuation) is pushed on the context, and
+operation is executed.  If it completes without any exception raised,
+context is popped and execution proceeds with continuation.  The
+execution is complete if term is true when the function returns.
+Otherwise, the thread is just suspending.
+
+If an exception is raised during the execution of operation, the
+trycatch function is called.  It finds the topmost TryWith context,
+extracts the handler and continuation and arranges for the thread to
+do the following:
+
+  run the handler with the exception as argument. The handler is run
+  in a regular try/with construct catching Match_Failure exceptions.
+  If a Match_Failure occurs, it means the handler rejects the
+  exception, the thread will itself call the trycatch function for
+  finding the next handler.  Note the try/with construct only applies
+  for _one step_ of the handler (if it cooperates, its continuation
+  won't be protected by the try/with -- this is what we want).
+
+  If the handler raises any other exception, it will be handled
+  normally (if it is raised during the first step, the try/with
+  catches it and passes it on).
+
+If no handler catches the exception ZZZ the context becomes empty
+ZZZ.
+
+An exception can occur only on a running thread, not on a blocked one.
+Thus, exception handling does not have to take care of any pending I/O
+operation.  ZZZ check this !
+
+
+TODO
+
+module Unix: handle_unix_error, error_message
+
+module Misc
+let rec restart_on_EINTR f x =
+  try f x with Unix_error (EINTR, _, _) -> restart_on_EINTR f x
+
+
+
+
+Obsolete stuff
+
+     - a boolean ref indicating liveliness (thread has been killed if
+       false -- used only for timeouts), TODO: has been removed
+
+Each time a thread is considered for execution, its liveliness ref is
+checked.  If it's false, the thread is simply discarded.  This
+provides an easy way to kill a thread independantly of the data
+structure it is currently stored in.  On the downside, the thread is
+effectively killed (and the ressources it uses can be reclaimed) only
+when it actually wakes up (except for threads blocked on I/O, see
+below).
