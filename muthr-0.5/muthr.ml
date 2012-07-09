@@ -11,7 +11,7 @@
    - OK - race condition on read_or_take and others
           the mv.read <- None should be done immediately in check_io
 
-   - really_write_or_take : quelle sémantique ?
+   - really_write_or_take : quelle sÃ©mantique ?
 
    - nb of threads active
    - ...
@@ -842,7 +842,7 @@ let recvfrom fd s ofs len l k =
 
 (*  
    ZZZ if we protect the Unix.close in a try/with, the select then fails...
-   à cause du [pending_io] qui n'était pas géré ??? apparemment non
+   Ã  cause du [pending_io] qui n'Ã©tait pas gÃ©rÃ© ??? apparemment non
  *)
 
 let close fd =
